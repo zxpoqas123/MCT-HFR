@@ -16,7 +16,7 @@ hidden=128 (indicates the hidden dimensions of Transformer layer)
 
 seed=2021 (indicates the random seed)
 
-missing_rate=0.2 (indicates the missing rate for training)
+missing_rate=0.2 (indicates the missing rate of input features)
 
 train_dynamic=1 (1 indicates the dynamic training, while 0 indicates the static training, i.e., one-to-one training)
 
