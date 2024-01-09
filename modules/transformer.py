@@ -381,6 +381,411 @@ class TransformerEncoderLayer(nn.Module):
         else:
             return x
 
+class MRU(nn.Module):
+    def __init__(self, embed_dim, num_heads=4, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1,
+                 attn_mask=False):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        self.self_attn = MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            attn_dropout=attn_dropout
+        )
+        self.cross_attn = MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            attn_dropout=attn_dropout
+        )
+
+        self.relu_dropout = relu_dropout
+        self.res_dropout = res_dropout
+        self.proj_weight_sa = Parameter(torch.Tensor(self.embed_dim, self.embed_dim))
+        self.proj_weight_ca = Parameter(torch.Tensor(self.embed_dim, self.embed_dim))
+        self.proj_bias = Parameter(torch.Tensor(self.embed_dim))
+        self.sigmoid = nn.Sigmoid()
+
+        self.fc1 = Linear(self.embed_dim, 4*self.embed_dim)   # The "Add & Norm" part in the paper
+        self.fc2 = Linear(4*self.embed_dim, self.embed_dim)
+        self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for _ in range(2)])
+
+    def forward(self, x_s, x_t, key_padding_mask_s=None, key_padding_mask_t=None):
+        sa, _ = self.self_attn(query=x_t, key=x_t, value=x_t, key_padding_mask=key_padding_mask_t)
+        ca, _ = self.cross_attn(query=x_t, key=x_s, value=x_s, key_padding_mask=key_padding_mask_s)
+        G = self.sigmoid(torch.matmul(sa,self.proj_weight_sa)+torch.matmul(ca,self.proj_weight_ca)+self.proj_bias)
+        x = G*ca + (1-G)*sa
+        x = self.layer_norms[0](x)
+
+        residual = x
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, p=self.relu_dropout, training=self.training)
+        x = self.fc2(x)
+        x = F.dropout(x, p=self.res_dropout, training=self.training)
+        x = residual + x
+        x = self.layer_norms[1](x)
+        return x
+
+class PMRlayer(nn.Module):
+    def __init__(self, embed_dim, num_heads=4, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1,
+                 attn_mask=False):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.mru_c2a = MRU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_c2v = MRU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_c2l = MRU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_a2c = MRU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_v2c = MRU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_l2c = MRU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+
+        self.relu_dropout = relu_dropout
+        self.res_dropout = res_dropout
+        self.ctx_len = 3
+        self.fc1 = Linear(self.embed_dim, 4*self.embed_dim)   # The "Add & Norm" part in the paper
+        self.fc2 = Linear(4*self.embed_dim, self.embed_dim)
+        self.layer_norms = LayerNorm(self.embed_dim)
+        self.proj_weight_zc1 = Parameter(torch.Tensor(self.ctx_len*self.embed_dim, self.ctx_len*self.embed_dim))
+        self.proj_weight_zc2 = Parameter(torch.Tensor(self.ctx_len*self.embed_dim, self.ctx_len*self.embed_dim))
+        self.proj_weight_zc3 = Parameter(torch.Tensor(self.ctx_len*self.embed_dim, self.ctx_len*self.embed_dim))
+        self.U = Parameter(torch.Tensor(self.ctx_len*self.embed_dim,1))
+        self.softmax = torch.nn.Softmax(dim=1)
+        self.tanh = torch.nn.Tanh()
+
+    def cal_coeff(self, x, w):
+        # x: L,B,D
+        bsz = x.shape[1]
+        x = x.permute(1,0,2).reshape(bsz,-1) # x: B,L*D
+        x = torch.matmul(self.tanh(torch.matmul(x,w)),self.U) # B,1
+        return x
+
+    def forward(self, inputs, input_padding_masks):        
+        audio, vision, text, ctx = inputs  # (L,B,D)
+        key_padding_mask_a, key_padding_mask_v, key_padding_mask_l , ctx_padding_mask = input_padding_masks # (B,L)
+
+        za = self.mru_c2a(ctx, audio, ctx_padding_mask, key_padding_mask_a)
+        zv = self.mru_c2v(ctx, vision, ctx_padding_mask, key_padding_mask_v)
+        zl = self.mru_c2l(ctx, text, ctx_padding_mask, key_padding_mask_l)
+
+        zc1 = self.mru_a2c(za, ctx, key_padding_mask_a, ctx_padding_mask)
+        zc2 = self.mru_v2c(zv, ctx, key_padding_mask_v, ctx_padding_mask)
+        zc3 = self.mru_l2c(zl, ctx, key_padding_mask_l, ctx_padding_mask)
+
+        #coeffi = self.softmax(torch.cat([self.cal_coeff(zc1,self.proj_weight_zc1),self.cal_coeff(zc2,self.proj_weight_zc2),self.cal_coeff(zc3,self.proj_weight_zc3)],dim=-1))
+        #x = (coeffi[:,0].reshape(1,-1,1))*zc1 + (coeffi[:,1].reshape(1,-1,1))*zc2 + (coeffi[:,2].reshape(1,-1,1))*zc3 
+        zc = zc1+zc2+zc3
+        '''
+        residual = x
+        x = self.layer_norms(x)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, p=self.relu_dropout, training=self.training)
+        x = self.fc2(x)
+        x = F.dropout(x, p=self.res_dropout, training=self.training)
+        zc = residual + x
+        '''
+        
+        return [za,zv,zl,zc]
+
+class PMREncoder(nn.Module):
+    """
+    Transformer encoder consisting of *args.encoder_layers* layers. Each layer
+    is a :class:`TransformerEncoderLayer`.
+    Args:
+        embed_tokens (torch.nn.Embedding): input embedding
+        num_heads (int): number of heads
+        layers (int): number of layers
+        relu_dropout (float): dropout applied on the first layer of the residual block
+        res_dropout (float): dropout applied on the residual block
+    """
+
+    def __init__(self, embed_dim, num_heads, layers, relu_dropout=0.0, res_dropout=0.0,
+                 embed_dropout=0.0, position_embedding=True):
+        super().__init__()
+        self.dropout = embed_dropout      # Embedding dropout
+        self.embed_dim = embed_dim
+        self.embed_scale = math.sqrt(embed_dim)
+        #self.embed_scale = 1
+        self.res_dropout = res_dropout
+        if position_embedding:
+            self.embed_positions = SinusoidalPositionalEmbedding(embed_dim)
+        else: 
+            self.embed_positions = None
+
+        self.layers = nn.ModuleList([])
+        for layer in range(layers):
+            new_layer = PMRlayer(embed_dim,
+                                num_heads=num_heads,
+                                relu_dropout=relu_dropout,
+                                res_dropout=res_dropout)
+            self.layers.append(new_layer)
+
+        self.register_buffer('version', torch.Tensor([2]))
+        self.normalize = False
+        if self.normalize:
+            self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for _ in range(3)])
+
+    def masked_avg_pooling(self, x, x_mask_padding):
+        # x: Dimension (seq_len, batch_size, n_features)
+        # x_mask_padding: Dimension (batch_size, seq_len)
+        x_mask_values = torch.logical_not(x_mask_padding).transpose(0,1).unsqueeze(-1)  # True indicates the position of values, Dimension (seq_len,batch_size,1)
+        x_avg_pool = ((x*x_mask_values).sum(0))/(x_mask_values.sum(0))  # x_avg_pool: (batch_size, n_features)
+        return x_avg_pool
+
+    def forward(self, inputs, input_padding_masks):
+        """
+        Args:
+            x_in (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+            x_in_k (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+            x_in_v (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+        Returns:
+            dict:
+                - **encoder_out** (Tensor): the last encoder layer's output of
+                  shape `(src_len, batch, embed_dim)`
+                - **encoder_padding_mask** (ByteTensor): the positions of
+                  padding elements of shape `(batch, src_len)`
+        """
+        # embed tokens and positions
+        #ctx = torch.cat(inputs, dim=0)
+        #ctx_padding_mask = torch.cat(input_padding_masks, dim=1)
+        inputs = list(inputs)
+        for i in range(len(inputs)):
+            inputs[i] = self.preprocess(inputs[i]) 
+        audio, vision, text = inputs  # (L,B,D)
+        key_padding_mask_a, key_padding_mask_v, key_padding_mask_l = input_padding_masks # (B,L)
+        ctx = torch.cat(inputs, dim=0)
+        ctx_padding_mask = torch.cat(input_padding_masks, dim=1)        
+        #ctx = torch.stack((self.masked_avg_pooling(audio,key_padding_mask_a),self.masked_avg_pooling(vision,key_padding_mask_v),self.masked_avg_pooling(text,key_padding_mask_l))) 
+        #ctx_padding_mask = None        
+        # encoder layers
+        x = [audio, vision, text, ctx]
+        padding_masks = [key_padding_mask_a, key_padding_mask_v, key_padding_mask_l, ctx_padding_mask]
+
+        intermediates = [x]
+        for layer in self.layers:
+            x = layer(x, padding_masks)
+            intermediates.append(x)
+
+        if self.normalize:
+            for i in range(3):
+                x[i] = self.layer_norms[i](x[i])
+
+        return x[0],x[1],x[2]
+
+    def max_positions(self):
+        """Maximum input length supported by the encoder."""
+        if self.embed_positions is None:
+            return self.max_source_positions
+        return min(self.max_source_positions, self.embed_positions.max_positions())
+
+    def preprocess(self, x_in):
+        x = self.embed_scale * x_in
+        if self.embed_positions is not None:
+            x += self.embed_positions(x_in.transpose(0, 1)[:, :, 0]).transpose(0, 1)   # Add positional embedding
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+        
+class MPU(nn.Module):
+    def __init__(self, embed_dim, num_heads=4, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1,
+                 attn_mask=False):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        self.self_attn = MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            attn_dropout=attn_dropout
+        )
+        self.cross_attn = MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            attn_dropout=attn_dropout
+        )
+
+        self.relu_dropout = relu_dropout
+        self.res_dropout = res_dropout
+        self.proj_weight_sa = Parameter(torch.Tensor(self.embed_dim, self.embed_dim))
+        self.proj_weight_ca = Parameter(torch.Tensor(self.embed_dim, self.embed_dim))
+        self.proj_bias = Parameter(torch.Tensor(self.embed_dim))
+        self.sigmoid = nn.Sigmoid()
+
+        self.fc1 = Linear(self.embed_dim, 4*self.embed_dim)   # The "Add & Norm" part in the paper
+        self.fc2 = Linear(4*self.embed_dim, self.embed_dim)
+        self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for _ in range(2)])
+
+    def forward(self, x_s, x_t, key_padding_mask_s=None, key_padding_mask_t=None):
+        ca, _ = self.cross_attn(query=x_t, key=x_s, value=x_s, key_padding_mask=key_padding_mask_s)
+        sa, _ = self.self_attn(query=ca, key=ca, value=ca, key_padding_mask=key_padding_mask_t)
+        #G = self.sigmoid(torch.matmul(sa,self.proj_weight_sa)+torch.matmul(ca,self.proj_weight_ca)+self.proj_bias)
+        #x = G*ca + (1-G)*sa
+        x = self.layer_norms[0](sa)
+
+        residual = x
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, p=self.relu_dropout, training=self.training)
+        x = self.fc2(x)
+        x = F.dropout(x, p=self.res_dropout, training=self.training)
+        x = residual + x
+        x = self.layer_norms[1](x)
+        return x
+
+class EMTlayer(nn.Module):
+    def __init__(self, embed_dim, num_heads=4, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1,
+                 attn_mask=False):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.mru_c2a = MPU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_c2v = MPU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_c2l = MPU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_a2c = MPU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_v2c = MPU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+        self.mru_l2c = MPU(embed_dim,num_heads=num_heads,relu_dropout=relu_dropout,res_dropout=res_dropout)
+
+        self.relu_dropout = relu_dropout
+        self.res_dropout = res_dropout
+        self.ctx_len = 3
+        self.fc1 = Linear(self.embed_dim, 4*self.embed_dim)   # The "Add & Norm" part in the paper
+        self.fc2 = Linear(4*self.embed_dim, self.embed_dim)
+        self.layer_norms = LayerNorm(self.embed_dim)
+        self.proj_weight_zc1 = Parameter(torch.Tensor(self.ctx_len*self.embed_dim, self.ctx_len*self.embed_dim))
+        self.proj_weight_zc2 = Parameter(torch.Tensor(self.ctx_len*self.embed_dim, self.ctx_len*self.embed_dim))
+        self.proj_weight_zc3 = Parameter(torch.Tensor(self.ctx_len*self.embed_dim, self.ctx_len*self.embed_dim))
+        self.U = Parameter(torch.Tensor(self.ctx_len*self.embed_dim,1))
+        self.softmax = torch.nn.Softmax(dim=1)
+        self.tanh = torch.nn.Tanh()
+
+    def cal_coeff(self, x, w):
+        # x: L,B,D
+        bsz = x.shape[1]
+        x = x.permute(1,0,2).reshape(bsz,-1) # x: B,L*D
+        x = torch.matmul(self.tanh(torch.matmul(x,w)),self.U) # B,1
+        return x
+
+    def forward(self, inputs, input_padding_masks):        
+        audio, vision, text, ctx = inputs  # (L,B,D)
+        key_padding_mask_a, key_padding_mask_v, key_padding_mask_l , ctx_padding_mask = input_padding_masks # (B,L)
+
+        za = self.mru_c2a(ctx, audio, ctx_padding_mask, key_padding_mask_a)
+        zv = self.mru_c2v(ctx, vision, ctx_padding_mask, key_padding_mask_v)
+        zl = self.mru_c2l(ctx, text, ctx_padding_mask, key_padding_mask_l)
+
+        zc1 = self.mru_a2c(za, ctx, key_padding_mask_a, ctx_padding_mask)
+        zc2 = self.mru_v2c(zv, ctx, key_padding_mask_v, ctx_padding_mask)
+        zc3 = self.mru_l2c(zl, ctx, key_padding_mask_l, ctx_padding_mask)
+
+        #coeffi = self.softmax(torch.cat([self.cal_coeff(zc1,self.proj_weight_zc1),self.cal_coeff(zc2,self.proj_weight_zc2),self.cal_coeff(zc3,self.proj_weight_zc3)],dim=-1))
+        #x = (coeffi[:,0].reshape(1,-1,1))*zc1 + (coeffi[:,1].reshape(1,-1,1))*zc2 + (coeffi[:,2].reshape(1,-1,1))*zc3
+        
+
+        #residual = x
+        #x = self.layer_norms(x)
+        #x = F.relu(self.fc1(x))
+        #x = F.dropout(x, p=self.relu_dropout, training=self.training)
+        #x = self.fc2(x)
+        #x = F.dropout(x, p=self.res_dropout, training=self.training)
+        #zc = residual + x
+        
+        zc = zc1+zc2+zc3
+
+        return [za,zv,zl,zc]
+        
+class EMTEncoder(nn.Module):
+    """
+    Transformer encoder consisting of *args.encoder_layers* layers. Each layer
+    is a :class:`TransformerEncoderLayer`.
+    Args:
+        embed_tokens (torch.nn.Embedding): input embedding
+        num_heads (int): number of heads
+        layers (int): number of layers
+        relu_dropout (float): dropout applied on the first layer of the residual block
+        res_dropout (float): dropout applied on the residual block
+    """
+
+    def __init__(self, embed_dim, num_heads, layers, relu_dropout=0.0, res_dropout=0.0,
+                 embed_dropout=0.0, position_embedding=True):
+        super().__init__()
+        self.dropout = embed_dropout      # Embedding dropout
+        self.embed_dim = embed_dim
+        self.embed_scale = math.sqrt(embed_dim)
+        #self.embed_scale = 1
+        self.res_dropout = res_dropout
+        if position_embedding:
+            self.embed_positions = SinusoidalPositionalEmbedding(embed_dim)
+        else: 
+            self.embed_positions = None
+
+        self.layers = nn.ModuleList([])
+        for layer in range(layers):
+            new_layer = EMTlayer(embed_dim,
+                                num_heads=num_heads,
+                                relu_dropout=relu_dropout,
+                                res_dropout=res_dropout)
+            self.layers.append(new_layer)
+
+        self.register_buffer('version', torch.Tensor([2]))
+        self.normalize = False
+        if self.normalize:
+            self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for _ in range(3)])
+
+    def masked_avg_pooling(self, x, x_mask_padding):
+        # x: Dimension (seq_len, batch_size, n_features)
+        # x_mask_padding: Dimension (batch_size, seq_len)
+        x_mask_values = torch.logical_not(x_mask_padding).transpose(0,1).unsqueeze(-1)  # True indicates the position of values, Dimension (seq_len,batch_size,1)
+        x_avg_pool = ((x*x_mask_values).sum(0))/(x_mask_values.sum(0))  # x_avg_pool: (batch_size, n_features)
+        return x_avg_pool
+
+    def forward(self, inputs, input_padding_masks):
+        """
+        Args:
+            x_in (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+            x_in_k (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+            x_in_v (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+        Returns:
+            dict:
+                - **encoder_out** (Tensor): the last encoder layer's output of
+                  shape `(src_len, batch, embed_dim)`
+                - **encoder_padding_mask** (ByteTensor): the positions of
+                  padding elements of shape `(batch, src_len)`
+        """
+        # embed tokens and positions
+        inputs = list(inputs)
+        for i in range(len(inputs)):
+            inputs[i] = self.preprocess(inputs[i]) 
+        audio, vision, text = inputs  # (L,B,D)
+        key_padding_mask_a, key_padding_mask_v, key_padding_mask_l = input_padding_masks # (B,L)
+        ctx = torch.stack((self.masked_avg_pooling(audio,key_padding_mask_a),self.masked_avg_pooling(vision,key_padding_mask_v),self.masked_avg_pooling(text,key_padding_mask_l))) 
+        ctx_padding_mask = None        
+        #ctx = torch.cat(inputs, dim=0)
+        #ctx_padding_mask = torch.cat(input_padding_masks, dim=1)        
+        # encoder layers
+        x = [audio, vision, text, ctx]
+        padding_masks = [key_padding_mask_a, key_padding_mask_v, key_padding_mask_l, ctx_padding_mask]
+
+        intermediates = [x]
+        for layer in self.layers:
+            x = layer(x, padding_masks)
+            intermediates.append(x)
+
+        if self.normalize:
+            for i in range(3):
+                x[i] = self.layer_norms[i](x[i])
+
+        return x[0],x[1],x[2],x[3]
+
+    def max_positions(self):
+        """Maximum input length supported by the encoder."""
+        if self.embed_positions is None:
+            return self.max_source_positions
+        return min(self.max_source_positions, self.embed_positions.max_positions())
+
+    def preprocess(self, x_in):
+        x = self.embed_scale * x_in
+        if self.embed_positions is not None:
+            x += self.embed_positions(x_in.transpose(0, 1)[:, :, 0]).transpose(0, 1)   # Add positional embedding
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
 def fill_with_neg_inf(t):
     """FP16-compatible function that fills a tensor with -inf."""
     return t.float().fill_(float('-inf')).type_as(t)
