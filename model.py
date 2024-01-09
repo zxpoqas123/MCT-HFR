@@ -6,7 +6,7 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 from torch.autograd import Function
 from collections import OrderedDict
-from modules.transformer import TransformerEncoder, TransformerDecoder, MITransformerEncoder
+from modules.transformer import TransformerEncoder, TransformerDecoder, MITransformerEncoder, PMREncoder, EMTEncoder
 from modules.mctransformer import MCTransformerEncoder
 
 ######################################## MulT ########################################
@@ -739,6 +739,234 @@ class MISA(nn.Module):
 
         return res
 
+######################################## PMR ########################################
+#input: (batch_size, seq_len, n_features)
+#(A,V,L)
+class PMR(nn.Module):
+    def __init__(self, feature_size=[512,512,512], emotion_cls=4, h_dims=128, dropout=0.25, layers=4):
+        super(PMR, self).__init__()
+        self.orig_d_a, self.orig_d_v, self.orig_d_l = feature_size
+        self.d = h_dims
+        self.num_heads = 4
+        self.layers = layers
+        self.relu_dropout = 0.1
+        self.res_dropout = 0.1
+        self.out_dropout = 0.0
+        self.embed_dropout = dropout
+        
+        # 1. Temporal convolutional layers
+        self.proj_l = nn.Conv1d(self.orig_d_l, self.d, kernel_size=1, padding=0, bias=False)
+        self.proj_a = nn.Conv1d(self.orig_d_a, self.d, kernel_size=1, padding=0, bias=False)
+        self.proj_v = nn.Conv1d(self.orig_d_v, self.d, kernel_size=1, padding=0, bias=False)
+
+        # 2. Multimodal collaborative attentions
+        self.pmr = PMREncoder(embed_dim=h_dims,
+                                        num_heads=self.num_heads,
+                                        layers=layers,
+                                        relu_dropout=self.relu_dropout,
+                                        res_dropout=self.res_dropout,
+                                        embed_dropout=self.embed_dropout,
+                                        position_embedding=True)       
+        # Projection layers
+        self.fusion_subnet = GATE_F(emotion_cls=emotion_cls, embedding_dim=h_dims, h_dims=h_dims//2, dropout=dropout)
+
+    def conv_proj(self, audio, vision, text):
+        x_a, x_v, x_l = audio.transpose(1, 2), vision.transpose(1, 2), text.transpose(1, 2)
+        proj_x_a = x_a if self.orig_d_a == self.d else self.proj_a(x_a)
+        proj_x_v = x_v if self.orig_d_v == self.d else self.proj_v(x_v)
+        proj_x_l = x_l if self.orig_d_l == self.d else self.proj_l(x_l)        
+        proj_x_a = proj_x_a.permute(2, 0, 1)
+        proj_x_v = proj_x_v.permute(2, 0, 1)
+        proj_x_l = proj_x_l.permute(2, 0, 1)
+        return proj_x_a, proj_x_v, proj_x_l
+
+    def forward(self, inputs, input_padding_masks):
+        """
+        text, audio, and vision should have dimension [batch_size, seq_len, n_features]
+        key_padding_mask_a, key_padding_mask_v, and key_padding_mask_l should have dimension [batch_size, seq_len]
+        """
+        audio, vision, text = inputs
+        # Project the textual/visual/audio features
+        proj_x_a, proj_x_v, proj_x_l = self.conv_proj(audio, vision, text)
+        # alignment
+        (h_as,h_vs,h_ls),_,_ = self.pmr((proj_x_a,proj_x_v,proj_x_l), input_padding_masks)
+        h_as,h_vs,h_ls = h_as.transpose(0, 1),h_vs.transpose(0, 1), h_ls.transpose(0, 1)   # shape: (L,B,D) -> (B,L,D)
+        # fusion&classification
+        res = self.fusion_subnet((h_as,h_vs,h_ls),input_padding_masks)
+        return res
+
+
+######################################## EMT ########################################
+#input: (batch_size, seq_len, n_features)
+#(A,V,L)
+class EMT(nn.Module):
+    def __init__(self, feature_size=[512,512,512], emotion_cls=4, h_dims=128, dropout=0.25, layers=4):
+        super(EMT, self).__init__()
+        self.orig_d_a, self.orig_d_v, self.orig_d_l = feature_size
+        self.d = h_dims
+        self.num_heads = 4
+        self.layers = layers
+        self.relu_dropout = 0.1
+        self.res_dropout = 0.1
+        self.out_dropout = 0.0
+        self.embed_dropout = dropout
+        self.attn_dropout = 0.0
+        # 1. Temporal convolutional layers
+        self.proj_l = nn.Conv1d(self.orig_d_l, self.d, kernel_size=1, padding=0, bias=False)
+        self.proj_a = nn.Conv1d(self.orig_d_a, self.d, kernel_size=1, padding=0, bias=False)
+        self.proj_v = nn.Conv1d(self.orig_d_v, self.d, kernel_size=1, padding=0, bias=False)
+
+        # 2. Multimodal collaborative attentions
+        self.mct = EMTEncoder(embed_dim=h_dims,
+                                        num_heads=self.num_heads,
+                                        layers=layers,
+                                        relu_dropout=self.relu_dropout,
+                                        res_dropout=self.res_dropout,
+                                        embed_dropout=self.embed_dropout,
+                                        position_embedding=True)       
+
+        self.generator_l = nn.Linear(self.d, self.orig_d_l)
+        self.generator_a = nn.Linear(self.d, self.orig_d_a)
+        self.generator_v = nn.Linear(self.d, self.orig_d_v)
+        self.gen_loss = RECLoss()
+
+        ## projector
+        ## gmc_tokens: global multimodal context
+        gmc_tokens_dim = 3 * self.d
+        self.gmc_tokens_projector = Projector(gmc_tokens_dim, gmc_tokens_dim)
+        self.text_projector = Projector(self.d, self.d)
+        self.audio_projector = Projector(self.d, self.d)
+        self.video_projector = Projector(self.d, self.d)
+
+        ## predictor
+        self.gmc_tokens_predictor = Predictor(gmc_tokens_dim, gmc_tokens_dim//2, gmc_tokens_dim)
+        self.text_predictor = Predictor(self.d, self.d//2, self.d)
+        self.audio_predictor = Predictor(self.d, self.d//2, self.d)
+        self.video_predictor = Predictor(self.d, self.d//2, self.d)
+
+        # Projection layers
+        self.fusion_subnet = GATE_F(emotion_cls=emotion_cls, embedding_dim=h_dims, h_dims=h_dims//2, dropout=dropout)
+
+    def conv_proj(self, audio, vision, text):
+        x_a, x_v, x_l = audio.transpose(1, 2), vision.transpose(1, 2), text.transpose(1, 2)
+        proj_x_a = x_a if self.orig_d_a == self.d else self.proj_a(x_a)
+        proj_x_v = x_v if self.orig_d_v == self.d else self.proj_v(x_v)
+        proj_x_l = x_l if self.orig_d_l == self.d else self.proj_l(x_l)        
+        proj_x_a = proj_x_a.permute(2, 0, 1)
+        proj_x_v = proj_x_v.permute(2, 0, 1)
+        proj_x_l = proj_x_l.permute(2, 0, 1)
+        return proj_x_a, proj_x_v, proj_x_l
+
+    def forward(self, inputs, inputs_m, input_padding_masks, input_missing_masks):
+        """
+        text, audio, and vision should have dimension [batch_size, seq_len, n_features]
+        key_padding_mask_a, key_padding_mask_v, and key_padding_mask_l should have dimension [batch_size, seq_len]
+        """
+        audio, vision, text = inputs
+        #audio_ref, vision_ref, text_ref = audio.clone().detach(), vision.clone().detach(), text.clone().detach()
+        audio_m, vision_m, text_m = inputs_m
+        key_padding_mask_a, key_padding_mask_v, key_padding_mask_l = input_padding_masks
+        missing_mask_a, missing_mask_v, missing_mask_l = input_missing_masks
+        # Project the textual/visual/audio features
+        proj_x_a_m, proj_x_v_m, proj_x_l_m = self.conv_proj(audio_m, vision_m, text_m)
+        proj_x_a, proj_x_v, proj_x_l = self.conv_proj(audio, vision, text)
+
+        h_as_m,h_vs_m,h_ls_m,ctx_m = self.mct((proj_x_a_m,proj_x_v_m,proj_x_l_m), input_padding_masks)       
+        h_as,h_vs,h_ls,ctx = self.mct((proj_x_a,proj_x_v,proj_x_l), input_padding_masks)    #h_as: (L,B,D), ctx: (3,B,D)
+        
+        # low-level feature reconstruction
+        audio_ = h_as_m if self.orig_d_a == self.d else self.generator_a(h_as_m.permute(1, 0, 2))       # (L,B,D) -> (B,L,D)
+        vision_ = h_vs_m if self.orig_d_v == self.d else self.generator_v(h_vs_m.permute(1, 0, 2)) 
+        text_ = h_ls_m if self.orig_d_l == self.d else self.generator_l(h_ls_m.permute(1, 0, 2))
+        audio_gen_loss = self.gen_loss(audio_, audio, missing_mask_a)
+        vision_gen_loss = self.gen_loss(vision_, vision, missing_mask_v)   
+        text_gen_loss = self.gen_loss(text_, text, missing_mask_l)
+
+        losses = {'text_gen_loss':text_gen_loss,'audio_gen_loss':audio_gen_loss,'vision_gen_loss':vision_gen_loss}
+
+        ctx_utt = ctx.permute(1,0,2).reshape(-1,3*self.d)
+        ctx_utt_m = ctx_m.permute(1,0,2).reshape(-1,3*self.d)
+        text_utt, audio_utt, video_utt = h_ls[0], h_as[0], h_vs[0]
+        text_utt_m, audio_utt_m, video_utt_m = h_ls_m[0], h_as_m[0], h_vs_m[0]
+
+        # high-level feature attraction via SimSiam
+        ## projector
+        z_gmc_tokens = self.gmc_tokens_projector(ctx_utt)
+        z_text = self.text_projector(text_utt)
+        z_audio = self.audio_projector(audio_utt)
+        z_video = self.video_projector(video_utt)
+
+        z_gmc_tokens_m = self.gmc_tokens_projector(ctx_utt_m)
+        z_text_m = self.text_projector(text_utt_m)
+        z_audio_m = self.audio_projector(audio_utt_m)
+        z_video_m = self.video_projector(video_utt_m)
+
+        ## predictor
+        p_gmc_tokens = self.gmc_tokens_predictor(z_gmc_tokens)
+        p_text = self.text_predictor(z_text)
+        p_audio = self.audio_predictor(z_audio)
+        p_video = self.video_predictor(z_video)
+
+        p_gmc_tokens_m = self.gmc_tokens_predictor(z_gmc_tokens_m)
+        p_text_m = self.text_predictor(z_text_m)
+        p_audio_m = self.audio_predictor(z_audio_m)
+        p_video_m = self.video_predictor(z_video_m)
+
+        intermedias = {
+            'z_gmc_tokens': z_gmc_tokens.detach(),
+            'p_gmc_tokens': p_gmc_tokens,
+            'z_text': z_text.detach(),
+            'p_text': p_text,
+            'z_audio': z_audio.detach(),
+            'p_audio': p_audio,
+            'z_video': z_video.detach(),
+            'p_video': p_video,
+            'z_gmc_tokens_m': z_gmc_tokens_m.detach(),
+            'p_gmc_tokens_m': p_gmc_tokens_m,
+            'z_text_m': z_text_m.detach(),
+            'p_text_m': p_text_m,
+            'z_audio_m': z_audio_m.detach(),
+            'p_audio_m': p_audio_m,
+            'z_video_m': z_video_m.detach(),
+            'p_video_m': p_video_m            
+        }
+
+        # Global Feature Alignment
+        h_as_m,h_vs_m,h_ls_m = h_as_m.transpose(0, 1),h_vs_m.transpose(0, 1), h_ls_m.transpose(0, 1)   # shape: (L,B,D) -> (B,L,D) 
+        h_as,h_vs,h_ls = h_as.transpose(0, 1),h_vs.transpose(0, 1), h_ls.transpose(0, 1) 
+        
+        # fusion & classification
+        res = self.fusion_subnet((h_as,h_vs,h_ls),input_padding_masks)
+        res_m = self.fusion_subnet((h_as_m,h_vs_m,h_ls_m),input_padding_masks)
+        res_final = {'embed':res['embed'], 'embed_m':res_m['embed'], 
+                    'label':res['label'], 'label_m':res_m['label']}
+        res_final.update(losses)
+        res_final.update(intermedias)
+        return res_final
+
+class Projector(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+
+        self.net = nn.Sequential(nn.Linear(input_dim, output_dim),
+                                 nn.BatchNorm1d(output_dim, affine=False))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Predictor(nn.Module):
+    def __init__(self, input_dim, pred_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(input_dim, pred_dim, bias=False),
+                                 nn.BatchNorm1d(pred_dim),
+                                 nn.ReLU(inplace=True),  # hidden layer
+                                 nn.Linear(pred_dim, output_dim))  # output layer
+
+    def forward(self, x):
+        return self.net(x)
+
+
 
 ######################################## MCT ########################################
 #input: (batch_size, seq_len, n_features)
@@ -868,3 +1096,4 @@ class MCT(nn.Module):
                     'attn':attn[-1], 'attn_m':attn_m[-1]}
         res_final.update(losses)
         return res_final
+        
