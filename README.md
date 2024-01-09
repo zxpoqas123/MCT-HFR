@@ -10,15 +10,15 @@ bash prepare_missing_mask.sh
 
 gpu_id=0 (indicates which gpu to use) 
 
-model=MCT_4 (indicates which model type to use, the number 4 indicates 4 stacked layers, which can be replaced by any other number)
+model=MCT_4 (indicating which model type to use. The number 4 indicates 4 stacked layers, which can be replaced by any other number)
 
-hidden=128 (indicates the hidden dimensions of Transformer layer)
+hidden=128 (indicating the hidden dimensions of Transformer layer)
 
-seed=2021 (indicates the random seed)
+seed=2021 (indicating the random seed)
 
-missing_rate=0.2 (indicates the missing rate of input features)
+missing_rate=0.2 (indicating the missing rate of input features)
 
-train_dynamic=1 (1 indicates the dynamic training, while 0 indicates the static training, i.e., one-to-one training)
+train_dynamic=1 (indicating the dynamic training. Switching it to 0 will indicate the static training, i.e., one-to-one training)
 
 ### Model training:
 
