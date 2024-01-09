@@ -10,7 +10,7 @@ bash prepare_missing_mask.sh
 
 gpu_id=0 (indicates which gpu to use) 
 
-model=MCT_4 (indicates which model type to use)
+model=MCT_4 (indicates which model type to use, the number 4 indicates 4 stacked layers, which can be replaced by any other number)
 
 hidden=128 (indicates the hidden dimensions of Transformer layer)
 
