@@ -28,6 +28,4 @@ bash run.sh $gpu_id $model $hidden $seed $missing_rate $train_dynamic
 
 bash test.sh $gpu_id $model $hidden $seed $missing_rate $train_dynamic 
 
-#### Note: We first release the codes for data preparation and model training. The pre-processed feature files are coming soon.
-
 
