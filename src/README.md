@@ -4,6 +4,14 @@
 
 bash prepare_missing_mask.sh
 
+### Model training:
+
+bash run.sh $gpu_id $model $hidden $seed $missing_rate $train_dynamic 
+
+### Model evaluation:
+
+bash test.sh $gpu_id $model $hidden $seed $missing_rate $train_dynamic 
+
 ### Configuration statement:
 
 gpu_id=0 (indicating which gpu to use) 
@@ -17,11 +25,3 @@ seed=2021 (indicating the random seed)
 missing_rate=0.2 (indicating the missing rate of input features)
 
 train_dynamic=1 (indicating the dynamic training. Switching it to 0 will indicate the static training, i.e., one-to-one training)
-
-### Model training:
-
-bash run.sh $gpu_id $model $hidden $seed $missing_rate $train_dynamic 
-
-### Model evaluation:
-
-bash test.sh $gpu_id $model $hidden $seed $missing_rate $train_dynamic 
