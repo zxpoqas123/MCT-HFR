@@ -8,7 +8,7 @@ bash prepare_missing_mask.sh
 
 ### Configuration statement:
 
-gpu_id=0 (indicates which gpu to use) 
+gpu_id=0 (indicating which gpu to use) 
 
 model=MCT_4 (indicating which model type to use. The number 4 indicates 4 stacked layers, which can be replaced by any other number)
 
